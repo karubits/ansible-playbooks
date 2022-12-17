@@ -1,0 +1,175 @@
+---
+- name: Populate service facts
+  service_facts:
+
+- name: "Physical Host - ensure useful and essential packages for physical hardware"
+  apt:
+    name:
+      - fwupd                           # Firmware update daemon
+      - hwinfo
+      # implementation of IEEE 802.1ab (LLDP)
+      - lldpd
+      # information about hardware configuration
+      - lshw
+      # Memtest86+ scans your RAM for errors:
+      - memtest86+
+  retries: 3
+  delay: 3
+  register: apt_res_1
+  until: apt_res_1 is success
+  when:
+    - ansible_virtualization_role == 'host'
+  tags: apt
+
+- name: "Ensure packages useful to server administration are installed"
+  apt:
+    name:
+      - acl
+      - apt-transport-https
+      - at
+      - curl
+      - dnsutils
+      - htop
+      - lnav
+      - needrestart
+      - net-tools
+      - rsync
+      - sudo
+      - tmux
+      - unattended-upgrades
+      - vim
+      - wget
+      - zip
+    state: present
+  tags: apt
+
+- name: Ensure guest agent for KVM based VMs are installed.
+  apt:
+    name:
+      - qemu-guest-agent
+    state: present
+  when:
+    - ansible_virtualization_type == "kvm"
+    - ansible_virtualization_role == "guest"
+  notify: Restart qemu-guest-agent
+  tags: apt
+
+- name: Set timezone to Asia/Tokyo
+  community.general.timezone:
+    name: "{{ timezone }}"
+  notify:
+    - Restart syslog service
+    - Restart cron service
+
+- name: Ensure NTP servers are set
+  lineinfile:
+    dest: /etc/systemd/timesyncd.conf
+    state: present
+    backrefs: no
+    regexp: "^NTP=*"
+    line: "NTP={{ ntp_server_1 }} {{ ntp_server_2 }}"
+  notify: Restart timesyncd
+  when: "'systemd-timesyncd.service' in services"
+  tags:
+    - ntp
+
+- name: Ensure NTP fallback time servers are set
+  lineinfile:
+    dest: /etc/systemd/timesyncd.conf
+    state: present
+    backrefs: no
+    regexp: "^FallbackNTP=*"
+    line: "FallbackNTP={{ ntp_fallback_1 }} {{ ntp_fallback_2 }} {{ ntp_fallback_3 }}"
+  notify: Restart timesyncd
+  when: "'systemd-timesyncd.service' in services"
+  tags:
+    - ntp
+
+- name: Hardening sshd_config
+  lineinfile:
+    dest: /etc/ssh/sshd_config
+    state: present
+    backrefs: yes
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    validate: "/usr/sbin/sshd -t -f %s"
+  with_items:
+    - regexp: '^#?\s*PasswordAuthentication yes'
+      line: "PasswordAuthentication no"
+    - regexp: '^#?\s*PubkeyAuthentication'
+      line: "PubkeyAuthentication yes"
+    - regexp: '^#?\s*StrictModes'
+      line: "StrictModes yes"
+    - regexp: '^#?\s*ClientAliveCountMax'
+      line: "ClientAliveCountMax 0"
+    - regexp: '^#?\s*PermitEmptyPasswords'
+      line: "PermitEmptyPasswords no"
+  notify: Restart sshd
+
+- name: Hardening sshd_config - block root login for standard hosts
+  # Never block root login on Proxmox. Clusters communicate via SSH using certificates with the root user.
+  lineinfile:
+    dest: /etc/ssh/sshd_config
+    state: present
+    backrefs: yes
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+    validate: "/usr/sbin/sshd -t -f %s"
+  with_items:
+    - regexp: '^#?\s*PermitRootLogin'
+      line: "PermitRootLogin no"
+  notify: Restart sshd
+  when: not ansible_kernel_version is search("PVE")
+
+- name: Ensure root account has pretty colors
+  lineinfile:
+    dest: /root/.bashrc
+    state: present
+    backrefs: no
+    regexp: "{{ item.regexp }}"
+    line: "{{ item.line }}"
+  with_items:
+    - regexp: '^#?\s* export LS_OPTIONS'
+      line: export LS_OPTIONS='--color=auto'
+    - regexp: '^#?\s* eval '
+      line: eval "`dircolors`"
+    - regexp: '^#?\s*alias ls='
+      line: alias ls='ls $LS_OPTIONS -alh'
+
+- name: Color root terminal red
+  become_user: root
+  lineinfile:
+    path: /root/.bashrc
+    line: "{{ root_ps1 }}"
+
+- name: Ensure bash history is supercharged
+  template:
+    src: templates/history.j2
+    dest: /etc/profile.d/bash_history.sh
+
+- name: Ensure reboot checker is in place
+  template:
+    src: templates/reboot_check.j2
+    dest: /etc/profile.d/pending_reboot_check.sh
+    mode: u=rw,g=rw,o=r
+    owner: root
+    group: root
+
+- name: Ensure ssh keys from github are present
+  ansible.posix.authorized_key:
+    user: "{{ ansible_env.SUDO_USER }}"
+    state: present
+    key: "https://github.com/{{ github_username }}.keys"
+    exclusive: true
+    manage_dir: true
+
+- name: Ensure user {{ ansible_env.SUDO_USER }} can sudo without password
+  lineinfile:
+    path: "/etc/sudoers.d/{{ ansible_env.SUDO_USER }}"
+    line: "{{ ansible_env.SUDO_USER }} ALL=(ALL) NOPASSWD: ALL"
+    state: present
+    mode: 0440
+    create: yes
+    #validate: "visudo -cf %s"
+  become: yes
+  
